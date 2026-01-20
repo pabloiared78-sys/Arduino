@@ -1,0 +1,142 @@
+#include <SPI.h>
+#include <SD.h>
+#include <Wire.h>
+#include "RTClib.h"
+
+RTC_DS3231 rtc;
+const int chipSelect = 4;
+const int sensorPin = A0;
+const int ledPin = 13; 
+
+// --- CONFIGURACIÓN TÉCNICA ---
+const float FACTOR = 0.4655;   
+const int OFFSET = 508;        
+const float UMBRAL_ALTO = 130.0; 
+const float UMBRAL_BAJO = 110.0; 
+
+float vMaxMinuto = 0, vMinMinuto = 500;
+double sumaVcuadrado = 0;
+unsigned long muestras = 0;
+int picosContador = 0, caidasContador = 0;
+int ultimoMinuto = -1;
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000); 
+  Serial.println("--- INICIANDO DIAGNOSTICO ---");
+  
+  pinMode(ledPin, OUTPUT);
+
+  // 1. Probar RTC
+  Serial.print("Buscando RTC (Reloj)... ");
+  if (!rtc.begin()) {
+    Serial.println("ERROR: No se encuentra el RTC.");
+    errorFatal();
+  }
+  Serial.println("OK!");
+
+  // 2. Probar SD
+  Serial.print("Buscando Tarjeta SD... ");
+  if (!SD.begin(chipSelect)) {
+    Serial.println("ERROR: No se encuentra el modulo SD o la tarjeta.");
+    errorFatal();
+  }
+  Serial.println("OK!");
+
+  // 3. Probar Archivo
+  Serial.print("Verificando archivo ENERGIA.CSV... ");
+  crearEncabezado();
+  Serial.println("OK!");
+
+  ultimoMinuto = rtc.now().minute();
+  Serial.println("--- SISTEMA LISTO Y MONITOREANDO ---");
+}
+
+void loop() {
+  // ESCUCHAR COMANDOS DESDE PC
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'L' || c == 'l') descargarDatos();
+    if (c == 'B' || c == 'b') borrarHistorial();
+  }
+
+  // LECTURA DE VOLTAJE (Ciclo de 100ms)
+  double sumaInstante = 0;
+  long cuentaInstante = 0;
+  unsigned long tiempoInicio = millis();
+  while (millis() - tiempoInicio < 100) { 
+    int raw = analogRead(sensorPin);
+    float vInstante = abs(raw - OFFSET) * FACTOR;
+    sumaInstante += pow(vInstante, 2);
+    cuentaInstante++;
+  }
+  float vRMS = sqrt(sumaInstante / cuentaInstante) * 1.1; 
+  if (vRMS < 15) vRMS = 0;
+
+  // Registro de extremos
+  if (vRMS > vMaxMinuto) vMaxMinuto = vRMS;
+  if (vRMS < vMinMinuto && vRMS > 10) vMinMinuto = vRMS;
+
+  // Conteo de picos y caídas
+  static bool bP = false, bC = false;
+  if (vRMS > UMBRAL_ALTO && !bP) { picosContador++; bP = true; }
+  else if (vRMS < UMBRAL_ALTO - 2) bP = false;
+  if (vRMS < UMBRAL_BAJO && vRMS > 30 && !bC) { caidasContador++; bC = true; }
+  else if (vRMS > UMBRAL_BAJO + 2) bC = false;
+
+  sumaVcuadrado += vRMS;
+  muestras++;
+
+  // GUARDADO CADA MINUTO
+  DateTime now = rtc.now();
+  if (now.minute() != ultimoMinuto) {
+    float vProm = (float)(sumaVcuadrado / muestras);
+    escribirSD(now, vProm);
+    // Reiniciar contadores
+    vMaxMinuto = 0; vMinMinuto = 500; sumaVcuadrado = 0; 
+    muestras = 0; picosContador = 0; caidasContador = 0;
+    ultimoMinuto = now.minute();
+  }
+}
+
+void crearEncabezado() {
+  if (!SD.exists("ENERGIA.CSV")) {
+    File f = SD.open("ENERGIA.CSV", FILE_WRITE);
+    f.println("Fecha,Hora,V_Max,V_Min,V_RMS_Prom,Picos,Caidas");
+    f.close();
+  }
+}
+
+void borrarHistorial() {
+  Serial.println("Comando Recibido: Borrando solo ENERGIA.CSV...");
+  SD.remove("ENERGIA.CSV");
+  crearEncabezado();
+  Serial.println("SD Limpia. Nuevo archivo creado.");
+}
+
+void descargarDatos() {
+  File f = SD.open("ENERGIA.CSV");
+  if (f) {
+    while (f.available()) Serial.write(f.read());
+    f.close();
+    Serial.println("\n--- FIN DE DESCARGA ---");
+  }
+}
+
+void escribirSD(DateTime t, float prom) {
+  File f = SD.open("ENERGIA.CSV", FILE_WRITE);
+  if (f) {
+    f.print(t.day()); f.print('/'); f.print(t.month()); f.print('/'); f.print(t.year()); f.print(',');
+    if(t.hour()<10) f.print('0'); f.print(t.hour()); f.print(':');
+    if(t.minute()<10) f.print('0'); f.print(t.minute()); f.print(',');
+    f.print(vMaxMinuto); f.print(','); f.print(vMinMinuto); f.print(',');
+    f.print(prom); f.print(','); f.print(picosContador); f.print(',');
+    f.println(caidasContador);
+    f.close();
+    digitalWrite(ledPin, HIGH); delay(100); digitalWrite(ledPin, LOW);
+  }
+}
+
+void errorFatal() {
+  while(1) { digitalWrite(ledPin, HIGH); delay(500); digitalWrite(ledPin, LOW); delay(500); }
+}
